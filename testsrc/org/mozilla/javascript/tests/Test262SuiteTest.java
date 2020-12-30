@@ -40,9 +40,8 @@ import org.mozilla.javascript.RhinoException;
 import org.mozilla.javascript.Script;
 import org.mozilla.javascript.Scriptable;
 import org.mozilla.javascript.drivers.TestUtils;
-import org.mozilla.javascript.tools.SourceReader;
+import org.mozilla.javascript.test262Testing.Test262File;
 import org.mozilla.javascript.tools.shell.ShellContextFactory;
-import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.error.YAMLException;
 
 @RunWith(Parameterized.class)
@@ -51,11 +50,12 @@ public class Test262SuiteTest {
     static final int[] OPT_LEVELS;
 
     private static final File testDir = new File("test262/test");
-    private static final String testHarnessDir = "test262/harness/";
     private static final String testProperties = "testsrc/test262.properties";
 
     static Map<Integer, Map<String, Script>> HARNESS_SCRIPT_CACHE = new HashMap<>();
     static Map<File, Integer> EXCLUDED_TESTS = new LinkedHashMap<>();
+
+    static Set<String> DO_NOT_COMPILE_TESTS = new HashSet<>();
 
     static ShellContextFactory CTX_FACTORY = new ShellContextFactory();
 
@@ -87,7 +87,8 @@ public class Test262SuiteTest {
             "regexp-unicode-property-escapes",
             "super",
             "tail-call-optimization",
-            "u180e"
+            "u180e",
+            "Symbol.isConcatSpreadable"
     ));
 
     static {
@@ -129,30 +130,30 @@ public class Test262SuiteTest {
         }
     }
 
+    private static final Pattern HARD_EXCLUDE_PATTERN = Pattern.compile("!!\\s*(.+)");
     private static final Pattern EXCLUDE_PATTERN = Pattern.compile("!\\s*(.+)");
 
     private final String testFilePath;
     private final int optLevel;
     private final boolean useStrict;
     private final Test262Case testCase;
-    private final boolean fails;
+    private final boolean markedAsFailing;
 
-    public Test262SuiteTest(String testFilePath, int optLevel, boolean useStrict, Test262Case testCase, boolean fails) {
+    public Test262SuiteTest(String testFilePath, int optLevel, boolean useStrict, Test262Case testCase, boolean markedAsFailing) {
         this.testFilePath = testFilePath;
         this.optLevel = optLevel;
         this.useStrict = useStrict;
         this.testCase = testCase;
-        this.fails = fails;
+        this.markedAsFailing = markedAsFailing;
     }
 
     private Scriptable buildScope(Context cx) throws IOException {
         Scriptable scope = cx.initSafeStandardObjects();
         for (String harnessFile : testCase.harnessFiles) {
             if (!HARNESS_SCRIPT_CACHE.get(optLevel).containsKey(harnessFile)) {
-                String harnessPath = testHarnessDir + harnessFile;
-                try (Reader reader = new FileReader(harnessPath)) {
+                try (Reader reader = new FileReader(harnessFile)) {
                     HARNESS_SCRIPT_CACHE.get(optLevel).put(harnessFile,
-                            cx.compileReader(reader, harnessPath, 1, null));
+                            cx.compileReader(reader, harnessFile, 1, null));
                 }
             }
             HARNESS_SCRIPT_CACHE.get(optLevel).get(harnessFile).exec(cx, scope);
@@ -206,7 +207,7 @@ public class Test262SuiteTest {
                             testCase.hasEarlyError ? "early" : "runtime"));
                 }
 
-                if (fails) {
+                if (markedAsFailing) {
                     Integer count = EXCLUDED_TESTS.get(testCase.file);
                     if (count != null) {
                         count -= 1;
@@ -214,7 +215,7 @@ public class Test262SuiteTest {
                     }
                 }
             } catch (RhinoException ex) {
-                if (fails) {
+                if (markedAsFailing) {
                     return;
                 }
 
@@ -232,13 +233,8 @@ public class Test262SuiteTest {
                 }
 
                 assertEquals(ex.details(), testCase.expectedError, errorName);
-            } catch (Exception ex) {
-                if (fails) {
-                    return;
-                }
-                throw ex;
-            } catch (AssertionError ex) {
-                if (fails) {
+            } catch (Exception | AssertionError ex) {
+                if (markedAsFailing) {
                     return;
                 }
                 throw ex;
@@ -300,15 +296,24 @@ public class Test262SuiteTest {
                         }
 
                         String excludeSubstr = m.group(1);
-                        int excludeCount = 0;
+                        boolean foundExcludedFile = false;
                         for (File file : dirFiles) {
                             String path = file.getPath().replaceAll("\\\\", "/");
                             if (path.endsWith(excludeSubstr)) {
                                 failingFiles.add(file);
-                                excludeCount++;
+                                foundExcludedFile = true;
+                            } else {
+                                Matcher hardExclude = HARD_EXCLUDE_PATTERN.matcher(line);
+                                if (hardExclude.matches()) {
+                                    String hardExcludeSubstr = hardExclude.group(1);
+                                    if (path.endsWith(hardExcludeSubstr)) {
+                                        DO_NOT_COMPILE_TESTS.add(path);
+                                        foundExcludedFile = true;
+                                    }
+                                }
                             }
                         }
-                        if (excludeCount == 0) {
+                        if (!foundExcludedFile) {
                             System.err.format(
                                     "WARN: Exclusion '%s' at line #%d doesn't exclude anything%n",
                                     excludeSubstr, lineNo);
@@ -363,7 +368,10 @@ public class Test262SuiteTest {
                 testCase.hasFlag("async")) {
                 continue;
             }
-
+            // 3. File should be skipped (for example, rhino can't parse it)
+            if (DO_NOT_COMPILE_TESTS.contains(testFile.getPath())) {
+                continue;
+            }
             String caseShortPath = testDir.toPath().relativize(testFile.toPath()).toString();
             for (int optLevel : OPT_LEVELS) {
                 boolean markedAsFailing = failingFiles.contains(testFile);
@@ -389,7 +397,6 @@ public class Test262SuiteTest {
     }
 
     private static class Test262Case {
-        private static final Yaml YAML = new Yaml();
 
         private final File file;
         private final String source;
@@ -427,50 +434,16 @@ public class Test262SuiteTest {
             return expectedError != null;
         }
 
-        @SuppressWarnings("unchecked")
         static Test262Case fromSource(File testFile) throws IOException {
-            String testSource = (String) SourceReader.readFileOrUrl(testFile.getPath(), true, "UTF-8");
-
-            Set<String> harnessFiles = new HashSet<>();
-
-            String metadataStr = testSource.substring(
-                    testSource.indexOf("/*---") + 5,
-                    testSource.indexOf("---*/"));
-            Map<String, Object> metadata = (Map<String, Object>) YAML.load(metadataStr);
-
-            if (metadata.containsKey("includes")) {
-                harnessFiles.addAll((List<String>) metadata.get("includes"));
-            }
-
-            String expectedError = null;
-            boolean isEarly = false;
-            if (metadata.containsKey("negative")) {
-                Map<String, String> negative = (Map<String, String>) metadata.get("negative");
-                expectedError = negative.get("type");
-                isEarly = "early".equals(negative.get("phase"));
-            }
-
-            Set<String> flags = new HashSet<>();
-            if (metadata.containsKey("flags")) {
-                flags.addAll((Collection<String>) metadata.get("flags"));
-            }
-
-            Set<String> features = new HashSet<>();
-            if (metadata.containsKey("features")) {
-                features.addAll((Collection<String>) metadata.get("features"));
-            }
-
-            if (!flags.contains("raw")) {
-                // present by default harness files
-                harnessFiles.add("assert.js");
-                harnessFiles.add("sta.js");
-            } else if (!harnessFiles.isEmpty()) {
-                System.err.format(
-                        "WARN: case '%s' is flagged as 'raw' but also has defined includes%n",
-                        testFile.getPath());
-            }
-
-            return new Test262Case(testFile, testSource, harnessFiles, expectedError, isEarly, flags, features);
+            Test262File test262File = new Test262File(testFile);
+            return new Test262Case(
+                    testFile,
+                    test262File.getTestSource(),
+                    test262File.getHarnessFiles(),
+                    test262File.getExpectedError(),
+                    test262File.isEarly(),
+                    test262File.getFlags(),
+                    test262File.getFeatures());
         }
     }
 }
